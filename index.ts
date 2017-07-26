@@ -144,11 +144,19 @@ async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
                 });
             items.push(newItem);
         }
+        console.log('items', items);
+
+        const response = await fetch(`${SERVER}/items/sync`, {
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt.token}` },
+            method: "POST",
+            body: JSON.stringify({ items, sync_token: '' })
+        });
+        const itemsReceived = await response.json();
+        console.log('items received', itemsReceived);
     }
     catch (e) {
         console.error('Error', e)
     }
-    console.log(items);
 }
 
 // register('foo@test.com', 'testing', false)
