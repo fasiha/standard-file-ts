@@ -2,11 +2,17 @@ const SERVER = 'https://sync.standardnotes.org';
 const COST = 100e3;
 
 import { readFileSync, writeFile } from "fs";
-import { randomBytes, createHash, pbkdf2, createHmac, createCipheriv } from 'crypto';
+import { randomBytes, createHash, pbkdf2, createHmac, createCipheriv, createDecipheriv } from 'crypto';
 import fetch from "node-fetch";
 const promisify = require("es6-promisify");
 const pbkdf2Async = promisify(pbkdf2);
 const randomBytesAsync = promisify(randomBytes);
+
+function hmacSha256(key: Buffer | string, text: string): string {
+    const hmac = createHmac('sha256', key)
+    hmac.update(text);
+    return hmac.digest('hex');
+}
 
 async function generatePasswordKey(userpass: string, pw_cost: number, pw_salt: string) {
     const key = (await pbkdf2Async(userpass, pw_salt, pw_cost, 768 / 8, 'sha512') as Buffer).toString('hex');
@@ -27,9 +33,7 @@ async function registrationRequirements(userpass: string, pw_cost: number) {
     const { pw, mk, ak } = await generatePasswordKey(userpass, pw_cost, pw_salt);
 
     // HMAC the salt with the local-only authentication key to get a kind of password digest (stored on server)
-    const hmac = createHmac('sha256', pw_cost.toString() + ':' + pw_salt);
-    hmac.update(ak);
-    const pw_auth = hmac.digest('hex');
+    const pw_auth = hmacSha256(pw_cost.toString() + ':' + pw_salt, ak);
 
     // Server gets server-side password, password digest, cost, and salt during registration.
     return { pw, pw_cost, pw_auth, pw_salt };
@@ -65,12 +69,10 @@ async function login(email: string, userpass: string) {
     // Ensure that the password is correct by comparing server-provided and regenerated password digests of `ak`.
     // If this doesn't match, don't even send anything to the server, it won't work.
     const hmacSecret: string = authParams.pw_cost.toString() + ':' + authParams.pw_salt;
-    const hmac = createHmac('sha256', hmacSecret)
-    hmac.update(ak);
-    const local_pw_auth = hmac.digest('hex');
+    const local_pw_auth = hmacSha256(hmacSecret, ak);
 
     if (local_pw_auth !== authParams.pw_auth) {
-        console.error('Local password did not match server’s record!');
+        throw new Error('Local password did not match server’s record');
     }
 
     // Assuming we're sure the password is correct, send the regenerated server-side password to log in.
@@ -87,23 +89,60 @@ async function login(email: string, userpass: string) {
     return { authResponse, mk, ak };
 }
 
-async function cipherContent(cleartext: string, encryption_key: Buffer) {
+async function cipherContent(cleartext: string | Buffer, encryption_key: Buffer) {
     const iv = await randomBytesAsync(128 / 8);
     const cipher = createCipheriv('aes-256-cbc', encryption_key, iv);
-    let ciphertext = cipher.update(cleartext, 'utf8', 'base64');
+    let ciphertext;
+    if (typeof cleartext === 'string') {
+        ciphertext = cipher.update(cleartext, 'utf8', 'base64');
+    } else {
+        ciphertext = cipher.update(cleartext, 'binary', 'base64');
+    }
     ciphertext += cipher.final('base64');
     return { iv: iv.toString('hex'), ciphertext };
 }
 
-async function encrypt002(cleartext: string, uuid: string, encryption_key: Buffer, authentication_key: Buffer) {
+async function decipherContent(ciphertext: string, encryption_key: Buffer, iv: Buffer) {
+    const decipher = createDecipheriv('aes-256-cbc', encryption_key, iv);
+    const decrypted = decipher.update(ciphertext, 'base64');
+    const final = decipher.final();
+    const decryptedFinal = Buffer.concat([decrypted, final]);
+    // return decrypted;
+    console.log(decrypted.length, decryptedFinal.length, decrypted.toString('hex') === decryptedFinal.toString('hex'))
+    // return decrypted;
+    return decryptedFinal;
+}
+
+async function encrypt002(cleartext: string | Buffer, uuid: string, encryption_key: Buffer, authentication_key: Buffer) {
     const ciphered = await cipherContent(cleartext, encryption_key);
     const string_to_auth = ['002', ciphered.iv, uuid, ciphered.ciphertext].join(':');
 
-    const hmac = createHmac('sha256', authentication_key)
-    hmac.update(string_to_auth);
-    const auth_hash = hmac.digest('hex');
+    const auth_hash = hmacSha256(authentication_key, string_to_auth);
     const result = ["002", auth_hash, ciphered.iv, uuid, ciphered.ciphertext].join(":")
     return result;
+}
+
+async function decrypt002(input: string, encryption_key: Buffer, authentication_key: Buffer, expectedUuid?: string) {
+    const components = input.split(':');
+    if (components.length !== 5) {
+        throw new Error('Input to decrypt002 lacks five colon-separated units');
+    }
+    const version = components[0];
+    const auth_hash = components[1];
+    const iv = components[2];
+    const uuid = components[3];
+    const ciphertext = components[4];
+
+    if (expectedUuid && uuid !== expectedUuid) {
+        throw new Error(`UUIDs did not match: got ${uuid}, expected ${expectedUuid}`);
+    }
+    const string_to_auth = [version, iv, uuid, ciphertext].join(":");
+    const local_auth_hash = hmacSha256(authentication_key, string_to_auth);
+    if (local_auth_hash !== auth_hash) {
+        console.error(`Authentication hashes do not match`);
+        return null;
+    }
+    return decipherContent(ciphertext, encryption_key, Buffer.from(iv, 'hex'))
 }
 
 interface Item {
@@ -138,7 +177,7 @@ async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
                 {
                     content: await encrypt002(JSON.stringify(origItem), origItem.uuid, item_ek, item_ak),
                     enc_item_key: await encrypt002(
-                        item_key.toString('utf8'),
+                        item_key,
                         origItem.uuid,
                         Buffer.from(mk, 'hex'),
                         Buffer.from(ak, 'hex'))
@@ -156,8 +195,32 @@ async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
         const itemsReceived = await response.json();
         console.log('ITEMS RECEIVED:', itemsReceived);
 
+        if (origItems.length > 0) {
+            return;
+        }
+
         // Decrypt received items
 
+        let itemsDecrypted = [];
+        for (const item of itemsReceived.retrieved_items) {
+            const item_key = await decrypt002(item.enc_item_key, Buffer.from(mk, 'hex'), Buffer.from(ak, 'hex'), item.uuid);
+            if (!item_key) {
+                console.error(`Skipping ${item.uuid} because of item_key error`)
+                itemsDecrypted.push(null);
+                continue;
+            }
+            const item_ek = item_key.slice(0, item_key.length / 2);
+            const item_ak = item_key.slice(item_key.length / 2, item_key.length);
+            const contents = await decrypt002(item.content, item_ek, item_ak, item.uuid);
+            if (!contents) {
+                console.error(`Skipping ${item.uuid} because of contents decryption error`)
+                itemsDecrypted.push(null);
+                continue;
+            }
+            // console.log(contents.toString('utf8').length);
+            itemsDecrypted.push(JSON.parse(contents.toString('utf8')));
+        }
+        console.log('DECRYPTED:', itemsDecrypted);
     }
     catch (e) {
         console.error('Error', e)
@@ -191,7 +254,7 @@ function makeItem(uuid: string,
     return { uuid, content, content_type, deleted, created_at, updated_at: updated_at || new Date(), enc_item_key: null }
 }
 
-const item: Item = makeItem('1234', { hi: "there", bye: "now" }, 'testing', false, new Date(), new Date());
+const item: Item = makeItem('12345', { hi: "there", bye: "now" }, 'testing', false, new Date(), new Date());
 
 // authResponse.then(({ authResponse, mk, ak }) => sync([item], mk, ak, authResponse));
 authResponse.then(({ authResponse, mk, ak }) => sync([], mk, ak, authResponse));
