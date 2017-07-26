@@ -83,7 +83,7 @@ async function login(email: string, userpass: string) {
 
     // Get a JWT in response
     const authResponse = await signinResponse.json();
-    console.log('JWT', authResponse);
+    console.log('JWT RESPONSE:', authResponse);
     return { authResponse, mk, ak };
 }
 
@@ -124,6 +124,7 @@ interface WebToken {
 async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
     let items: Item[] = [];
     try {
+        // Encrypt each item
         for (const origItem of origItems) {
             // Encryption key
             const item_ek: Buffer = await randomBytesAsync(512 / 8 / 2);
@@ -144,15 +145,19 @@ async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
                 });
             items.push(newItem);
         }
-        console.log('items', items);
+        console.log('ITEMS TO SEND:', items);
 
+        // Sync with server
         const response = await fetch(`${SERVER}/items/sync`, {
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt.token}` },
             method: "POST",
-            body: JSON.stringify({ items, sync_token: '' })
+            body: JSON.stringify({ items, sync_token: null })
         });
         const itemsReceived = await response.json();
-        console.log('items received', itemsReceived);
+        console.log('ITEMS RECEIVED:', itemsReceived);
+
+        // Decrypt received items
+
     }
     catch (e) {
         console.error('Error', e)
@@ -188,4 +193,5 @@ function makeItem(uuid: string,
 
 const item: Item = makeItem('1234', { hi: "there", bye: "now" }, 'testing', false, new Date(), new Date());
 
-authResponse.then(({ authResponse, mk, ak }) => sync([item], mk, ak, authResponse));
+// authResponse.then(({ authResponse, mk, ak }) => sync([item], mk, ak, authResponse));
+authResponse.then(({ authResponse, mk, ak }) => sync([], mk, ak, authResponse));
