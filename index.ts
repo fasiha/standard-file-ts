@@ -107,9 +107,6 @@ async function decipherContent(ciphertext: string, encryption_key: Buffer, iv: B
     const decrypted = decipher.update(ciphertext, 'base64');
     const final = decipher.final();
     const decryptedFinal = Buffer.concat([decrypted, final]);
-    // return decrypted;
-    console.log(decrypted.length, decryptedFinal.length, decrypted.toString('hex') === decryptedFinal.toString('hex'))
-    // return decrypted;
     return decryptedFinal;
 }
 
@@ -134,7 +131,8 @@ async function decrypt002(input: string, encryption_key: Buffer, authentication_
     const ciphertext = components[4];
 
     if (expectedUuid && uuid !== expectedUuid) {
-        throw new Error(`UUIDs did not match: got ${uuid}, expected ${expectedUuid}`);
+        console.error(`UUIDs did not match: got ${uuid}, expected ${expectedUuid}`);
+        // return null;
     }
     const string_to_auth = [version, iv, uuid, ciphertext].join(":");
     const local_auth_hash = hmacSha256(authentication_key, string_to_auth);
@@ -160,7 +158,8 @@ interface WebToken {
     token: string;
 }
 
-async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
+type SyncResult = { itemsReceived: any, itemsDecrypted: any };
+async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken, sync_token: string = null): Promise<SyncResult> {
     let items: Item[] = [];
     try {
         // Encrypt each item
@@ -190,14 +189,14 @@ async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
         const response = await fetch(`${SERVER}/items/sync`, {
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${jwt.token}` },
             method: "POST",
-            body: JSON.stringify({ items, sync_token: null })
+            body: JSON.stringify({ items, sync_token })
         });
         const itemsReceived = await response.json();
         console.log('ITEMS RECEIVED:', itemsReceived);
 
-        if (origItems.length > 0) {
-            return;
-        }
+        // if (origItems.length > 0) {
+        //     return { itemsReceived, itemsDecrypted: [] };
+        // }
 
         // Decrypt received items
 
@@ -221,6 +220,7 @@ async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
             itemsDecrypted.push(JSON.parse(contents.toString('utf8')));
         }
         console.log('DECRYPTED:', itemsDecrypted);
+        return { itemsDecrypted, itemsReceived }
     }
     catch (e) {
         console.error('Error', e)
@@ -237,7 +237,7 @@ async function sync(origItems: Item[], mk: string, ak: string, jwt: WebToken) {
 Server replied with 200
 */
 
-const authResponse = login('foo@test.com', 'testing');
+// const authResponse = login('foo@test.com', 'testing');
 /*
 JWT { user:
    { uuid: '38f41c3e-cc90-4384-a969-4337aa160987',
@@ -254,7 +254,12 @@ function makeItem(uuid: string,
     return { uuid, content, content_type, deleted, created_at, updated_at: updated_at || new Date(), enc_item_key: null }
 }
 
-const item: Item = makeItem('12345', { hi: "there", bye: "now" }, 'testing', false, new Date(), new Date());
+async function testing() {
+    let item: Item = makeItem('222', { just: "Updates are ok!" }, 'testing', false, new Date('2017-07-27T01:23:25.860Z'), new Date());
 
-// authResponse.then(({ authResponse, mk, ak }) => sync([item], mk, ak, authResponse));
-authResponse.then(({ authResponse, mk, ak }) => sync([], mk, ak, authResponse));
+    const authResponse = await login('foo@test.com', 'testing');
+
+    let syncResult = await sync([], authResponse.mk, authResponse.ak, authResponse.authResponse);
+    let sync2 = await sync([item], authResponse.mk, authResponse.ak, authResponse.authResponse, syncResult.itemsReceived.sync_token);
+}
+testing()
